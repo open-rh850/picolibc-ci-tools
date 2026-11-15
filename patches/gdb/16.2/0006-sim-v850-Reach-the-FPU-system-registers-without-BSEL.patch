@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Parthiban Nallathambi <parthiban@linumiz.com>
+Date: Sun, 15 Nov 2026 14:56:55 +0530
+Subject: [PATCH 6/9] sim: v850: Reach the FPU system registers without BSEL on
+ v850e3v5
+
+On v850e3v5 the FPU registers are regID 6 to 11 of selID 0 with no bank
+select. The simulator reached them only through BSEL, so programs ran
+with the reset FPSR.
+
+Signed-off-by: Parthiban Nallathambi <parthiban@linumiz.com>
+---
+ sim/testsuite/v850/fpu-sreg.cgs | 19 +++++++++++++++++++
+ sim/v850/v850-sim.h             |  1 +
+ sim/v850/v850.igen              | 16 +++++++++++++---
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+ create mode 100644 sim/testsuite/v850/fpu-sreg.cgs
+
+diff --git a/sim/testsuite/v850/fpu-sreg.cgs b/sim/testsuite/v850/fpu-sreg.cgs
+new file mode 100644
+index 00000000000..f73c133ae4d
+--- /dev/null
++++ b/sim/testsuite/v850/fpu-sreg.cgs
+@@ -0,0 +1,19 @@
++# v850e3v5 ldsr and stsr reach the FPU system registers at selID 0
++# without BSEL, FPCFG shows the FPSR.RM written through FPSR
++# mach: v850e3v5
++
++	.include "testutils.inc"
++
++	seti	0x000e0000, r20
++	ldsr	r20, 6, 0
++	stsr	6, r21, 0
++	reg	r21, 0x000e0000
++	stsr	10, r22, 0
++	reg	r22, 0x00000180
++
++	seti	0x00020000, r20
++	ldsr	r20, 6, 0
++	stsr	10, r22, 0
++	reg	r22, 0x00000000
++
++	pass
+diff --git a/sim/v850/v850-sim.h b/sim/v850/v850-sim.h
+index 1719cf8ef4a..10220fd70f4 100644
+--- a/sim/v850/v850-sim.h
++++ b/sim/v850/v850-sim.h
+@@ -150,6 +150,7 @@ nia = PC
+ #define FPCC  (FPU_SR[9])
+ #define FPCFG (FPU_SR[10])
+ #define FPCFG_REGNO 10
++#define FPEC_REGNO 11
+ 
+ #define FPSR_DEM  0x00200000
+ #define FPSR_SEM  0x00100000
+diff --git a/sim/v850/v850.igen b/sim/v850/v850.igen
+index 70a9e2ea7d6..99bb6e3dd56 100644
+--- a/sim/v850/v850.igen
++++ b/sim/v850/v850.igen
+@@ -949,8 +949,13 @@ regID,111111,RRRRR + selID,00000100000:IX:::ldsr
+ "ldsr r<reg1>, s<regID>, <selID>"
+ {
+   uint32_t sreg = GR[reg1];
++  unsigned int bank = BSEL & 0xffff;
+   TRACE_ALU_INPUT1 (GR[reg1]);
+ 
++  if (idecode_issue == idecode_v850e3v5_issue
++      && regID >= FPSR_REGNO && regID <= FPEC_REGNO)
++    bank = 0x2000;
++
+   /* FIXME: For now we ignore the selID.  */
+   if (idecode_issue == idecode_v850e3v5_issue && selID != 0)
+     {
+@@ -963,7 +968,7 @@ regID,111111,RRRRR + selID,00000100000:IX:::ldsr
+     {
+       int protect_p = (PSW & PSW_NPV) ? 1 : 0;
+ 
+-      switch (BSEL & 0xffff)
++      switch (bank)
+ 	{
+ 	case 0x0000:
+ 	  if ((PSW & PSW_NPV)
+@@ -1025,7 +1030,7 @@ regID,111111,RRRRR + selID,00000100000:IX:::ldsr
+ 
+       if (!protect_p)
+ 	{
+-	  switch (BSEL & 0xffff)
++	  switch (bank)
+ 	    {
+ 	    case 0x0000:
+ 	    case 0xff00:	/* user0 bank */
+@@ -2089,13 +2094,18 @@ rrrrr,111111,regID + 0000000001000000:IX:::stsr
+ "stsr s<regID>, r<reg2>"
+ {
+   uint32_t sreg = 0;
++  unsigned int bank = BSEL & 0xffff;
++
++  if (idecode_issue == idecode_v850e3v5_issue
++      && regID >= FPSR_REGNO && regID <= FPEC_REGNO)
++    bank = 0x2000;
+ 
+   if ((idecode_issue == idecode_v850e2_issue
+        || idecode_issue == idecode_v850e3v5_issue
+        || idecode_issue == idecode_v850e2v3_issue)
+       && regID < 28)
+     {
+-      switch (BSEL & 0xffff)
++      switch (bank)
+ 	{
+ 	case 0x0000:
+ 	case 0xff00:	/* USER 0 */

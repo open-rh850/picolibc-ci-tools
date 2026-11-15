@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Parthiban Nallathambi <parthiban@linumiz.com>
+Date: Sun, 15 Nov 2026 14:56:55 +0530
+Subject: [PATCH 9/9] sim: v850: Record the FPSR exception flags
+
+A disabled FP exception sets its XP flag, an enabled one sets XC and
+traps. The simulator set flags only for enabled exceptions, so no flag
+was set with the reset FPSR.
+
+Signed-off-by: Parthiban Nallathambi <parthiban@linumiz.com>
+---
+ sim/testsuite/v850/fpu-flags.cgs | 35 +++++++++++++++
+ sim/v850/simops.c                | 73 +++++++++++++++-----------------
+ sim/v850/simops.h                |  1 +
+ 3 files changed, 69 insertions(+), 40 deletions(-)
+ create mode 100644 sim/testsuite/v850/fpu-flags.cgs
+
+diff --git a/sim/testsuite/v850/fpu-flags.cgs b/sim/testsuite/v850/fpu-flags.cgs
+new file mode 100644
+index 00000000000..e253ad799f0
+--- /dev/null
++++ b/sim/testsuite/v850/fpu-flags.cgs
+@@ -0,0 +1,35 @@
++# v850 FPSR.XP after FP instructions with the exceptions disabled
++# mach: v850e3v5
++
++	.include "testutils.inc"
++
++	.macro	xp fpsr op r_a r_b want
++	seti	\fpsr, r20
++	ldsr	r20, 6, 0
++	seti	\r_a, r1
++	seti	\r_b, r2
++	\op	r2, r1, r3
++	stsr	6, r21, 0
++	andi	0x1f, r21, r21
++	reg	r21, \want
++	.endm
++
++# inexact: 1 + 2^-30
++	xp	0x00020000, addf.s, 0x3f800000, 0x30800000, 0x01
++# invalid: 0 / 0
++	xp	0x00020000, divf.s, 0x00000000, 0x00000000, 0x10
++# divide by zero: 1 / 0
++	xp	0x00020000, divf.s, 0x3f800000, 0x00000000, 0x08
++# overflow and inexact: 2^100 * 2^100
++	xp	0x00020000, mulf.s, 0x71800000, 0x71800000, 0x05
++# exact: 1 + 1
++	xp	0x00020000, addf.s, 0x3f800000, 0x3f800000, 0x00
++# XP is sticky
++	seti	0x00020001, r20
++	ldsr	r20, 6, 0
++	addf.s	r1, r1, r3
++	stsr	6, r21, 0
++	andi	0x1f, r21, r21
++	reg	r21, 0x01
++
++	pass
+diff --git a/sim/v850/simops.c b/sim/v850/simops.c
+index ac1a107fe54..cd53d37be71 100644
+--- a/sim/v850/simops.c
++++ b/sim/v850/simops.c
+@@ -2889,8 +2889,7 @@ v850_fpu_round_64 (sim_fpu *f, sim_fpu_round round, sim_fpu_denorm denorm)
+ void
+ update_fpsr (SIM_DESC sd, sim_fpu_status status, unsigned int mask, unsigned int double_op_p)
+ {
+-  unsigned int fpsr;
+-  unsigned int flags = 0;
++  unsigned int causes = 0;
+ 
+   if (fpu_input_flushed
+       && !(status & (sim_fpu_status_invalid_snan | sim_fpu_status_invalid_isi
+@@ -2900,20 +2899,8 @@ update_fpsr (SIM_DESC sd, sim_fpu_status status, unsigned int mask, unsigned int
+ 		     | sim_fpu_status_invalid_sqrt)))
+     status |= sim_fpu_status_inexact;
+   fpu_input_flushed = 0;
+-  fpsr = FPSR & mask;
+-
+-  if (fpsr & FPSR_XEI
+-      && ((status & (sim_fpu_status_rounded
+-		     | sim_fpu_status_overflow
+-		     | sim_fpu_status_inexact))
+-	  || (status & sim_fpu_status_underflow
+-	      && (fpsr & (FPSR_XEU | FPSR_XEI)) == 0
+-	      && fpsr & FPSR_FS)))
+-    {
+-      flags |= FPSR_XCI | FPSR_XPI;
+-    }
+ 
+-  if (fpsr & FPSR_XEV
++  if ((mask & FPSR_XEV)
+       && (status & (sim_fpu_status_invalid_isi
+ 		    | sim_fpu_status_invalid_imz
+ 		    | sim_fpu_status_invalid_zdz
+@@ -2921,36 +2908,48 @@ update_fpsr (SIM_DESC sd, sim_fpu_status status, unsigned int mask, unsigned int
+ 		    | sim_fpu_status_invalid_cvi
+ 		    | sim_fpu_status_invalid_sqrt
+ 		    | sim_fpu_status_invalid_snan)))
+-    {
+-      flags |= FPSR_XCV | FPSR_XPV;
+-    }
++    causes |= FPSR_XPV;
+ 
+-  if (fpsr & FPSR_XEZ
++  if ((mask & FPSR_XEZ)
+       && (status & sim_fpu_status_invalid_div0))
+-    {
+-      flags |= FPSR_XCV | FPSR_XPV;
+-    }
++    causes |= FPSR_XPZ;
+ 
+-  if (fpsr & FPSR_XEO
++  if ((mask & FPSR_XEO)
+       && (status & sim_fpu_status_overflow))
+-    {
+-      flags |= FPSR_XCO | FPSR_XPO;
+-    }
+-      
+-  if (((fpsr & FPSR_XEU) || (fpsr & FPSR_FS) == 0)
++    causes |= FPSR_XPO;
++
++  if ((mask & FPSR_XEU)
+       && (status & (sim_fpu_status_underflow
+ 		    | sim_fpu_status_denorm)))
+     {
+-      flags |= FPSR_XCU | FPSR_XPU;
++      causes |= FPSR_XPU;
++      if ((FPSR & FPSR_FS) && !(FPSR & FPSR_XEU))
++	causes |= FPSR_XPI;
+     }
+ 
+-  if (flags)
+-    {
+-      FPSR &= ~FPSR_XC;
+-      FPSR |= flags;
++  if ((mask & FPSR_XEI)
++      && (status & (sim_fpu_status_rounded
++		    | sim_fpu_status_overflow
++		    | sim_fpu_status_inexact)))
++    causes |= FPSR_XPI;
+ 
++  update_fpsr_causes (sd, causes, double_op_p);
++}
++
++/* Record the exception CAUSES (FPSR.XP bit layout) of an FP instruction:
++   enabled causes raise an exception with XC set to all causes, other
++   causes set their XP bits.  */
++
++void
++update_fpsr_causes (SIM_DESC sd, unsigned int causes, unsigned int double_op_p)
++{
++  if (causes & (FPSR & FPSR_XE) >> 5)
++    {
++      FPSR = (FPSR & ~FPSR_XC) | (causes << 10);
+       SignalExceptionFPE (sd, double_op_p);
+     }
++  else
++    FPSR |= causes;
+ }
+ 
+ /* Exception.  */
+@@ -3002,13 +3001,7 @@ v850_float_compare (SIM_DESC sd, int cmp, sim_fpu wop1, sim_fpu wop2, int double
+   if (sim_fpu_is_nan (&wop1) || sim_fpu_is_nan (&wop2))
+     {
+       if (cmp & 0x8)
+-	{
+-	  if (FPSR & FPSR_XEV)
+-	    {
+-	      FPSR |= FPSR_XCV | FPSR_XPV;
+-	      SignalExceptionFPE (sd, double_op_p);
+-	    }
+-	}
++	update_fpsr_causes (sd, FPSR_XPV, double_op_p);
+ 
+       switch (cmp)
+ 	{
+diff --git a/sim/v850/simops.h b/sim/v850/simops.h
+index 6710f74508e..3b19e99d917 100644
+--- a/sim/v850/simops.h
++++ b/sim/v850/simops.h
+@@ -106,6 +106,7 @@ extern void check_invalid_snan (SIM_DESC sd, sim_fpu_status, unsigned int);
+         update_fpsr (sd, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, double_op_p)
+ 
+ extern void update_fpsr (SIM_DESC sd, sim_fpu_status, unsigned int, unsigned int);
++extern void update_fpsr_causes (SIM_DESC sd, unsigned int, unsigned int);
+ extern void v850_fpu_32to (sim_fpu *, uint32_t);
+ extern void v850_fpu_232to (sim_fpu *, uint32_t, uint32_t);
+ extern int v850_fpu_round_32 (sim_fpu *, sim_fpu_round, sim_fpu_denorm);

@@ -1,0 +1,819 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Parthiban Nallathambi <parthiban@linumiz.com>
+Date: Sun, 15 Nov 2026 14:56:55 +0530
+Subject: [PATCH 8/9] sim: v850: Flush subnormals when FPSR FS is set
+
+With FS set the FPU flushes subnormal operands and results to zero and
+reports it in the flags. The simulator passed subnormals through.
+
+Signed-off-by: Parthiban Nallathambi <parthiban@linumiz.com>
+---
+ sim/testsuite/v850/fpu-fs.cgs |  83 +++++++++++++++
+ sim/v850/simops.c             |  95 ++++++++++++++++-
+ sim/v850/simops.h             |   4 +
+ sim/v850/v850-sim.h           |   2 +
+ sim/v850/v850.igen            | 192 +++++++++++++++++-----------------
+ 5 files changed, 278 insertions(+), 98 deletions(-)
+ create mode 100644 sim/testsuite/v850/fpu-fs.cgs
+
+diff --git a/sim/testsuite/v850/fpu-fs.cgs b/sim/testsuite/v850/fpu-fs.cgs
+new file mode 100644
+index 00000000000..23fafdbc6b8
+--- /dev/null
++++ b/sim/testsuite/v850/fpu-fs.cgs
+@@ -0,0 +1,83 @@
++# v850 FPSR.FS flush of subnormal operands and results
++# mach: v850e3v5
++
++	.include "testutils.inc"
++
++	.macro	fpsr val
++	seti	\val, r20
++	ldsr	r20, 6, 0
++	.endm
++
++	.macro	fpsr_if exp
++	stsr	6, r20, 0
++	seti	0x00400000, r21
++	and	r21, r20
++	reg	r20, \exp
++	.endm
++
++	seti	0x3f800000, r1
++
++# Input operand: +-subnormal becomes +-0 and sets FPSR.IF
++	fpsr	0x00020000
++	seti	0x00000001, r2
++	mulf.s	r1, r2, r3
++	reg	r3, 0
++	fpsr_if	0x00400000
++	fpsr	0x00020000
++	seti	0x80000001, r2
++	mulf.s	r1, r2, r3
++	reg	r3, 0x80000000
++
++# ABSF.S does not flush its operand
++	seti	0x80000001, r2
++	absf.s	r2, r3
++	reg	r3, 0x00000001
++
++# Result: 2^-100 * 2^-30 is subnormal before rounding
++	seti	0x0d800000, r4
++	seti	0x30800000, r5
++	seti	0x8d800000, r6
++
++	fpsr	0x00020000
++	mulf.s	r4, r5, r3
++	reg	r3, 0
++	fpsr_if	0
++	fpsr	0x00060000
++	mulf.s	r4, r5, r3
++	reg	r3, 0
++	fpsr	0x000a0000
++	mulf.s	r4, r5, r3
++	reg	r3, 0x00800000
++	mulf.s	r6, r5, r3
++	reg	r3, 0x80000000
++	fpsr	0x000e0000
++	mulf.s	r4, r5, r3
++	reg	r3, 0
++	mulf.s	r6, r5, r3
++	reg	r3, 0x80800000
++
++# RN with FN: 1.5 * 2^-127 goes to 2^-126, 2^-130 to 0
++	seti	0x20400000, r7
++	seti	0x1f800000, r8
++	fpsr	0x00820000
++	mulf.s	r7, r8, r3
++	reg	r3, 0x00800000
++	mulf.s	r4, r5, r3
++	reg	r3, 0
++
++# Double: 2^-600 * 2^-500 is flushed to +0
++	mov	0, r10
++	seti	0x1a700000, r11
++	mov	0, r12
++	seti	0x20b00000, r13
++	fpsr	0x00020000
++	mulf.d	r10, r12, r14
++	reg	r14, 0
++	reg	r15, 0
++
++# FS = 0 keeps the subnormal result
++	fpsr	0x00000000
++	mulf.s	r4, r5, r3
++	reg	r3, 0x00080000
++
++	pass
+diff --git a/sim/v850/simops.c b/sim/v850/simops.c
+index e2799af80e1..ac1a107fe54 100644
+--- a/sim/v850/simops.c
++++ b/sim/v850/simops.c
+@@ -2804,13 +2804,104 @@ OP_307E0 (void)
+   sim_fpu_status_denorm = 16384,				----U (sim spec.)
+ */  
+     
++static int fpu_input_flushed;
++
+ void
+-update_fpsr (SIM_DESC sd, sim_fpu_status status, unsigned int mask, unsigned int double_op_p)
++v850_fpu_32to (sim_fpu *f, uint32_t s)
+ {
+-  unsigned int fpsr = FPSR & mask;
++  SIM_DESC sd = simulator;
++
++  sim_fpu_32to (f, s);
++  if ((FPSR & FPSR_FS) && sim_fpu_is_denorm (f))
++    {
++      sim_fpu_32to (f, s & 0x80000000);
++      FPSR |= FPSR_IF;
++      fpu_input_flushed = 1;
++    }
++}
+ 
++void
++v850_fpu_232to (sim_fpu *f, uint32_t h, uint32_t l)
++{
++  SIM_DESC sd = simulator;
++
++  sim_fpu_232to (f, h, l);
++  if ((FPSR & FPSR_FS) && sim_fpu_is_denorm (f))
++    {
++      sim_fpu_232to (f, h & 0x80000000, 0);
++      FPSR |= FPSR_IF;
++      fpu_input_flushed = 1;
++    }
++}
++
++static int
++v850_fpu_flush_result (sim_fpu *f, sim_fpu_round round, int double_p)
++{
++  SIM_DESC sd = simulator;
++  int emin = double_p ? -1022 : -126;
++  int to_min;
++
++  if (!(FPSR & FPSR_FS)
++      || f->class != sim_fpu_class_number
++      || f->normal_exp >= emin)
++    return 0;
++
++  switch (round)
++    {
++    case sim_fpu_round_up:
++      to_min = !f->sign;
++      break;
++    case sim_fpu_round_down:
++      to_min = f->sign;
++      break;
++    case sim_fpu_round_near:
++      to_min = (FPSR & FPSR_FN) && f->normal_exp == emin - 1;
++      break;
++    default:
++      to_min = 0;
++      break;
++    }
++
++  if (double_p)
++    sim_fpu_232to (f, ((f->sign ? 0x80000000 : 0)
++		       | (to_min ? 0x00100000 : 0)), 0);
++  else
++    sim_fpu_32to (f, (f->sign ? 0x80000000 : 0) | (to_min ? 0x00800000 : 0));
++  return sim_fpu_status_underflow | sim_fpu_status_inexact;
++}
++
++int
++v850_fpu_round_32 (sim_fpu *f, sim_fpu_round round, sim_fpu_denorm denorm)
++{
++  int status = v850_fpu_flush_result (f, round, 0);
++
++  return status ? status : sim_fpu_round_32 (f, round, denorm);
++}
++
++int
++v850_fpu_round_64 (sim_fpu *f, sim_fpu_round round, sim_fpu_denorm denorm)
++{
++  int status = v850_fpu_flush_result (f, round, 1);
++
++  return status ? status : sim_fpu_round_64 (f, round, denorm);
++}
++
++void
++update_fpsr (SIM_DESC sd, sim_fpu_status status, unsigned int mask, unsigned int double_op_p)
++{
++  unsigned int fpsr;
+   unsigned int flags = 0;
+ 
++  if (fpu_input_flushed
++      && !(status & (sim_fpu_status_invalid_snan | sim_fpu_status_invalid_isi
++		     | sim_fpu_status_invalid_idi | sim_fpu_status_invalid_zdz
++		     | sim_fpu_status_invalid_imz | sim_fpu_status_invalid_cvi
++		     | sim_fpu_status_invalid_div0
++		     | sim_fpu_status_invalid_sqrt)))
++    status |= sim_fpu_status_inexact;
++  fpu_input_flushed = 0;
++  fpsr = FPSR & mask;
++
+   if (fpsr & FPSR_XEI
+       && ((status & (sim_fpu_status_rounded
+ 		     | sim_fpu_status_overflow
+diff --git a/sim/v850/simops.h b/sim/v850/simops.h
+index bdcba6921f7..6710f74508e 100644
+--- a/sim/v850/simops.h
++++ b/sim/v850/simops.h
+@@ -106,6 +106,10 @@ extern void check_invalid_snan (SIM_DESC sd, sim_fpu_status, unsigned int);
+         update_fpsr (sd, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, double_op_p)
+ 
+ extern void update_fpsr (SIM_DESC sd, sim_fpu_status, unsigned int, unsigned int);
++extern void v850_fpu_32to (sim_fpu *, uint32_t);
++extern void v850_fpu_232to (sim_fpu *, uint32_t, uint32_t);
++extern int v850_fpu_round_32 (sim_fpu *, sim_fpu_round, sim_fpu_denorm);
++extern int v850_fpu_round_64 (sim_fpu *, sim_fpu_round, sim_fpu_denorm);
+ 
+ 
+ /*
+diff --git a/sim/v850/v850-sim.h b/sim/v850/v850-sim.h
+index ba66cd0573e..f20875aea4f 100644
+--- a/sim/v850/v850-sim.h
++++ b/sim/v850/v850-sim.h
+@@ -156,6 +156,8 @@ nia = PC
+ #define FPSR_SEM  0x00100000
+ #define FPSR_RM   0x000c0000
+ #define FPSR_RN   0x00000000
++#define FPSR_FN   0x00800000
++#define FPSR_IF   0x00400000
+ #define FPSR_FS   0x00020000
+ #define FPSR_PR   0x00010000
+ 
+diff --git a/sim/v850/v850.igen b/sim/v850/v850.igen
+index 99bb6e3dd56..cab3c6d29fd 100644
+--- a/sim/v850/v850.igen
++++ b/sim/v850/v850.igen
+@@ -2430,12 +2430,12 @@ rrrr,0111111,RRRR,0 + wwww,010001110000:F_I:::addf_d
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
+-  sim_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
++  v850_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_add (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -2452,12 +2452,12 @@ rrrrr,111111,RRRRR + wwwww,10001100000:F_I:::addf_s
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_add (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -2584,10 +2584,10 @@ rrrr,011111100100 + wwww,010001010100:F_I:::cvtf_dl
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+-  status = sim_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+   status |= sim_fpu_to64i (&ans, &wop, FPSR_GET_ROUND());
+ 
+   check_cvt_fi (SD, status, 1);
+@@ -2606,10 +2606,10 @@ rrrr,011111100011 + wwwww,10001010010:F_I:::cvtf_ds
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+-  status = sim_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status = v850_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   check_cvt_fi (SD, status, 0);
+ 
+@@ -2627,10 +2627,10 @@ rrrr,011111100100 + wwwww,10001010000:F_I:::cvtf_dw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+-  status = sim_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+   status |= sim_fpu_to32i (&ans, &wop, FPSR_GET_ROUND());
+ 
+   check_cvt_fi (SD, status, 1);
+@@ -2653,7 +2653,7 @@ rrrr,011111100001 + wwww,010001010010:F_I:::cvtf_ld
+   TRACE_FP_INPUT_WORD2 (GR[reg2e], GR[reg2e+1]);
+ 
+   sim_fpu_i64to (&wop, op, FPSR_GET_ROUND());
+-  status = sim_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+ 
+   check_cvt_if (SD, status, 1);
+ 
+@@ -2675,7 +2675,7 @@ rrrr,011111100001 + wwwww,10001000010:F_I:::cvtf_ls
+   TRACE_FP_INPUT_WORD2 (GR[reg2e], GR[reg2e+1]);
+ 
+   sim_fpu_i64to (&wop, op, FPSR_GET_ROUND());
+-  status = sim_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+ 
+   check_cvt_if (SD, status, 0);
+ 
+@@ -2692,9 +2692,9 @@ rrrrr,11111100010 + wwww,010001010010:F_I:::cvtf_sd
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+-  status = sim_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status = v850_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   check_cvt_ff (SD, status, 1);
+ 
+@@ -2712,10 +2712,10 @@ rrrrr,11111100100 + wwww,010001000100:F_I:::cvtf_sl
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+-  status = sim_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+   status |= sim_fpu_to64i (&ans, &wop, FPSR_GET_ROUND());
+ 
+   check_cvt_fi (SD, status, 0);
+@@ -2735,10 +2735,10 @@ rrrrr,11111100100 + wwwww,10001000000:F_I:::cvtf_sw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+-  status = sim_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+   status |= sim_fpu_to32i (&ans, &wop, sim_fpu_round_zero);
+ 
+   check_cvt_fi (SD, status, 0);
+@@ -2758,7 +2758,7 @@ rrrrr,11111100000 + wwww,010001010010:F_I:::cvtf_wd
+ 
+   TRACE_FP_INPUT_WORD1 (GR[reg2]);
+   sim_fpu_i32to (&wop, GR[reg2], FPSR_GET_ROUND());
+-  status = sim_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_64 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+ 
+   check_cvt_if (SD, status, 1);
+ 
+@@ -2777,7 +2777,7 @@ rrrrr,11111100000 + wwwww,10001000010:F_I:::cvtf_ws
+ 
+   TRACE_FP_INPUT_WORD1 (GR[reg2]);
+   sim_fpu_i32to (&wop, GR[reg2], FPSR_GET_ROUND());
+-  status = sim_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
++  status = v850_fpu_round_32 (&wop, FPSR_GET_ROUND(), sim_fpu_denorm_zero);
+ 
+   check_cvt_if (SD, status, 0);
+ 
+@@ -2794,12 +2794,12 @@ rrrr,0111111,RRRR,0 + wwww,010001111110:F_I:::divf_d
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
+-  sim_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
++  v850_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_div (&ans, &wop2, &wop1);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -2816,12 +2816,12 @@ rrrrr,111111,RRRRR + wwwww,10001101110:F_I:::divf_s
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_div (&ans, &wop2, &wop1);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -2837,15 +2837,15 @@ rrrrr,111111,RRRRR + wwwww,101,W,00,WWWW,0:F_I:::maddf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_add (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -2861,15 +2861,15 @@ rrrrr,111111,RRRRR + wwwww,10011100000:F_I:::fmaf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_add (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3037,16 +3037,16 @@ rrrrr,111111,RRRRR + wwwww,101,W,01,WWWW,0:F_I:::msubf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_sub (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3062,15 +3062,15 @@ rrrrr,111111,RRRRR + wwwww,10011100010:F_I:::fmsf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_sub (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3087,12 +3087,12 @@ rrrr,0111111,RRRR,0 + wwww,010001110100:F_I:::mulf_d
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
+-  sim_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
++  v850_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -3109,12 +3109,12 @@ rrrrr,111111,RRRRR + wwwww,10001100100:F_I:::mulf_s
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3179,15 +3179,15 @@ rrrrr,111111,RRRRR + wwwww,101,W,10,WWWW,0:F_I:::nmaddf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_add (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_neg (&ans, &wop1);
+ 
+@@ -3205,15 +3205,15 @@ rrrrr,111111,RRRRR + wwwww,10011100100:F_I:::fnmaf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_add (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_neg (&ans, &wop1);
+ 
+@@ -3231,16 +3231,16 @@ rrrrr,111111,RRRRR + wwwww,101,W,11,WWWW,0:F_I:::nmsubf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_sub (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_neg (&ans, &wop1);
+ 
+@@ -3258,15 +3258,15 @@ rrrrr,111111,RRRRR + wwwww,10011100110:F_I:::fnmsf_s
+   sim_fpu ans, wop1, wop2, wop3;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
+-  sim_fpu_32to (&wop3, GR[reg3]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop3, GR[reg3]);
+   TRACE_FP_INPUT_FPU3 (&wop1, &wop2, &wop3);
+ 
+   status = sim_fpu_mul (&ans, &wop1, &wop2);
+   wop1 = ans;
+   status |= sim_fpu_sub (&ans, &wop1, &wop3);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop1 = ans;
+   status |= sim_fpu_neg (&ans, &wop1);
+ 
+@@ -3285,11 +3285,11 @@ rrrr,011111100001 + wwww,010001011110:F_I:::recipf.d
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_div (&ans, &sim_fpu_one, &wop);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -3306,11 +3306,11 @@ rrrrr,11111100001 + wwwww,10001001110:F_I:::recipf.s
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_div (&ans, &sim_fpu_one, &wop);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3327,14 +3327,14 @@ rrrr,011111100010 + wwww,010001011110:F_I:::rsqrtf.d
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_sqrt (&ans, &wop);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop = ans;
+   status = sim_fpu_div (&ans, &sim_fpu_one, &wop);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -3351,14 +3351,14 @@ rrrrr,11111100010 + wwwww,10001001110:F_I:::rsqrtf.s
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_sqrt (&ans, &wop);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+   wop = ans;
+   status = sim_fpu_div (&ans, &sim_fpu_one, &wop);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEZ | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3375,11 +3375,11 @@ rrrr,011111100000 + wwww,010001011110:F_I:::sqrtf.d
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_sqrt (&ans, &wop);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI, 1);
+ 
+@@ -3396,11 +3396,11 @@ rrrrr,11111100000 + wwwww,10001001110:F_I:::sqrtf.s
+   sim_fpu ans, wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_sqrt (&ans, &wop);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI, 0);
+ 
+@@ -3417,12 +3417,12 @@ rrrr,0111111,RRRR,0 + wwww,010001110010:F_I:::subf.d
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
+-  sim_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop1, GR[reg1e+1], GR[reg1e]);
++  v850_fpu_232to (&wop2, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_sub (&ans, &wop2, &wop1);
+-  status |= sim_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_64 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 1);
+ 
+@@ -3439,12 +3439,12 @@ rrrrr,111111,RRRRR + wwwww,10001100010:F_I:::subf.s
+   sim_fpu ans, wop1, wop2;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop1, GR[reg1]);
+-  sim_fpu_32to (&wop2, GR[reg2]);
++  v850_fpu_32to (&wop1, GR[reg1]);
++  v850_fpu_32to (&wop2, GR[reg2]);
+   TRACE_FP_INPUT_FPU2 (&wop1, &wop2);
+ 
+   status = sim_fpu_sub (&ans, &wop2, &wop1);
+-  status |= sim_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
++  status |= v850_fpu_round_32 (&ans, FPSR_GET_ROUND(), sim_fpu_denorm_underflow_inexact);
+ 
+   update_fpsr (SD, status, FPSR_XEV | FPSR_XEI | FPSR_XEO | FPSR_XEU, 0);
+ 
+@@ -3479,7 +3479,7 @@ rrrr,011111100001 + wwww,010001010100:F_I:::trncf_dl
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to64i (&ans, &wop, sim_fpu_round_zero);
+@@ -3501,7 +3501,7 @@ rrrr,011111110001 + wwww,010001010100:F_I:::trncf_dul
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to64u (&ans, &wop, sim_fpu_round_zero);
+@@ -3523,7 +3523,7 @@ rrrr,011111100001 + wwwww,10001010000:F_I:::trncf_dw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to32i (&ans, &wop, sim_fpu_round_zero);
+@@ -3544,7 +3544,7 @@ rrrr,011111110001 + wwwww,10001010000:F_I:::trncf_duw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
++  v850_fpu_232to (&wop, GR[reg2e+1], GR[reg2e]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to32u (&ans, &wop, sim_fpu_round_zero);
+@@ -3564,7 +3564,7 @@ rrrrr,11111100001 + wwww,010001000100:F_I:::trncf_sl
+   int64_t ans;
+   sim_fpu wop;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   sim_fpu_to64i (&ans, &wop, sim_fpu_round_zero);
+@@ -3583,7 +3583,7 @@ rrrrr,11111110001 + wwww,010001000100:F_I:::trncf_sul
+   uint64_t ans;
+   sim_fpu wop;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   sim_fpu_to64u (&ans, &wop, sim_fpu_round_zero);
+@@ -3603,7 +3603,7 @@ rrrrr,11111100001 + wwwww,10001000000:F_I:::trncf_sw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to32i (&ans, &wop, sim_fpu_round_zero);
+@@ -3624,7 +3624,7 @@ rrrrr,11111110001 + wwwww,10001000000:F_I:::trncf_suw
+   sim_fpu wop;
+   sim_fpu_status status;
+ 
+-  sim_fpu_32to (&wop, GR[reg2]);
++  v850_fpu_32to (&wop, GR[reg2]);
+   TRACE_FP_INPUT_FPU1 (&wop);
+ 
+   status = sim_fpu_to32u (&ans, &wop, sim_fpu_round_zero);
