@@ -31,7 +31,7 @@ env:
 
 jobs:
   build-qemu:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,11 +43,13 @@ jobs:
             patchdir: patches/qemu/11.1.3
             extra-args: "--enable-relocatable"
           - variant: "9.0" # For NIOS2, dropped in 9.1
+            runner: ubuntu-24.04
             target-list: "nios2-softmmu"
             repository: qemu/qemu
             ref: v9.0.4
             extra-args: "--enable-relocatable"
           - variant: arc
+            runner: ubuntu-24.04
             target-list: "arc-softmmu,arc64-softmmu"
             repository: foss-for-synopsys-dwc-arc-processors/qemu
             ref: 76e0fa9053b4184a29c9077959d484047eefe521
